@@ -65,6 +65,7 @@ async function dispatchPayinSuccess(referenceId, { utr, amount } = {}) {
   const payload = {
     event: "PAYIN_SUCCESS",
     type: "PAYIN_SUCCESS",
+    gateway_id: 2, // <--- ADDED THIS
     reference_id: referenceId,
     gateway_reference: payin?.transferId || `DUMMY_${Date.now()}`,
     status: "SUCCESS",
@@ -82,6 +83,7 @@ async function dispatchPayinFailed(referenceId, { reason, code, amount } = {}) {
   const payload = {
     event: "PAYIN_FAILED",
     type: "PAYIN_FAILED",
+    gateway_id: 2, // <--- ADDED THIS
     reference_id: referenceId,
     gateway_reference: payin?.transferId || `DUMMY_${Date.now()}`,
     status: "FAILED",
@@ -107,6 +109,7 @@ async function dispatchRefundSuccess(gatewayRefundId) {
   const payload = {
     event: "REFUND_SUCCESS",
     type: "REFUND_SUCCESS",
+    gateway_id: 2, // <--- ADDED THIS
     reference_id: refund.referenceId,
     gateway_refund_id: gatewayRefundId,
     refund_local_id: refund.localRefundId,
@@ -126,6 +129,7 @@ async function dispatchRefundFailed(gatewayRefundId, { reason, code } = {}) {
   const payload = {
     event: "REFUND_FAILED",
     type: "REFUND_FAILED",
+    gateway_id: 2, // <--- ADDED THIS
     reference_id: refund.referenceId,
     gateway_refund_id: gatewayRefundId,
     refund_local_id: refund.localRefundId,
@@ -155,6 +159,7 @@ async function dispatchChargebackCreated(
   const payload = {
     event: "CHARGEBACK_CREATED",
     type: "CHARGEBACK_CREATED",
+    gateway_id: 2, // <--- ADDED THIS
     reference_id: cb.referenceId,
     chargeback_id: gatewayChargebackId,
     amount: amount ?? cb.amount,
@@ -177,6 +182,7 @@ async function dispatchChargebackReversed(
   const payload = {
     event: "CHARGEBACK_REVERSED",
     type: "CHARGEBACK_REVERSED",
+    gateway_id: 2, // <--- ADDED THIS
     reference_id: cb.referenceId,
     chargeback_id: gatewayChargebackId,
     amount: cb.amount,
@@ -198,6 +204,7 @@ async function dispatchPayoutSuccess(referenceId, { utr, amount } = {}) {
   const payload = {
     event: "PAYOUT_SUCCESS",
     type: "PAYOUT_SUCCESS",
+    gateway_id: 2, // <--- ADDED THIS
     reference_id: referenceId,
     transfer_id: payout?.transferId || `DUMMY_${Date.now()}`,
     transfer_status: "SUCCESS",
@@ -216,6 +223,7 @@ async function dispatchPayoutFailed(referenceId, { reason, code, amount } = {}) 
   const payload = {
     event: "PAYOUT_FAILED",
     type: "PAYOUT_FAILED",
+    gateway_id: 2, // <--- ADDED THIS
     reference_id: referenceId,
     transfer_id: payout?.transferId || `DUMMY_${Date.now()}`,
     transfer_status: "FAILED",
@@ -238,6 +246,7 @@ async function dispatchPayoutPending(referenceId) {
   const payload = {
     event: "PAYOUT_PENDING",
     type: "PAYOUT_PENDING",
+    gateway_id: 2, // <--- ADDED THIS
     reference_id: referenceId,
     transfer_id: payout?.transferId || `DUMMY_${Date.now()}`,
     transfer_status: "PENDING",
