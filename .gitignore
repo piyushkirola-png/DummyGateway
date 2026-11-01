@@ -1,0 +1,9 @@
+node_modules/
+.env
+payout.txt
+payouts-*.csv
+payins-*.csv
+payout-*.csv
+payin-*.csv
+payin.txt
+*.log

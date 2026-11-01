@@ -1,0 +1,2165 @@
+﻿==================== C:\Users\DELL\Documents\DummyGateway\server.js ====================
+require("dotenv").config();
+const express = require("express");
+const cors = require("cors");
+const morgan = require("morgan");
+
+const bankAccountService = require("./services/bank-account.service");
+const payinStore = require("./services/payin-store.service");
+const bankAccountsRoutes = require("./routes/bank-accounts.routes");
+const payoutsRoutes = require("./routes/payouts.routes");
+const payinRoutes = require("./routes/payin.routes");
+const refundRoutes = require("./routes/refund.routes");
+const chargebackRoutes = require("./routes/chargeback.routes");
+const webhookTriggerRoutes = require("./routes/webhook-trigger.routes");
+const bankAccountGenerator = require("./services/bank-account-generator");
+const app = express();
+
+app.use(cors());
+app.use(express.json({ limit: "2mb" }));
+app.use(express.urlencoded({ extended: true }));
+app.use(morgan("dev"));
+
+app.get("/health", (req, res) => {
+  res.json({
+    ok: true,
+    service: "payout-mock",
+    port: process.env.PAYOUT_MOCK_PORT || 4100,
+    backendWebhookUrl: process.env.BACKEND_WEBHOOK_URL,
+    accounts: bankAccountService.listAccounts().length,
+    autoCallbacks: process.env.AUTO_CALLBACK_ENABLED === "true",
+    autoCallbackDelayMs: Number(process.env.AUTO_CALLBACK_DELAY_MS || 0),
+    uptime: process.uptime(),
+  });
+});
+
+// Dummy hosted checkout page
+app.get("/pay/:reference", (req, res) => {
+  const ref = req.params.reference;
+  const payin = payinStore.getPayin(ref);
+  if (!payin) {
+    return res.status(404).send(
+      `<html><body style="font-family:sans-serif;text-align:center;padding:50px">
+        <h1>Payment reference not found</h1>
+        <p>Reference: <code>${ref}</code></p>
+      </body></html>`,
+    );
+  }
+  return res.send(
+    `<html><body style="font-family:sans-serif;text-align:center;padding:50px">
+      <h1>Dummy Payment Checkout</h1>
+      <p><strong>Reference:</strong> ${payin.referenceId}</p>
+      <p><strong>Amount:</strong> INR ${payin.amount} ${payin.currency}</p>
+      <p><strong>Status:</strong> ${payin.status}</p>
+      <p>The mock will fire a webhook in a few seconds.</p>
+      <p>This page is just a placeholder - no action needed.</p>
+    </body></html>`,
+  );
+});
+
+app.use("/bank-accounts", bankAccountsRoutes);
+app.use("/payouts", payoutsRoutes);
+app.use("/payin", payinRoutes);
+app.use("/refund", refundRoutes);
+app.use("/chargeback", chargebackRoutes);
+app.use("/webhook", webhookTriggerRoutes);
+
+app.use((req, res) => {
+  res.status(404).json({ success: false, message: "Route not found" });
+});
+
+app.use((err, req, res, next) => {
+  console.error("[PayoutMock] Error:", err.message);
+  res.status(err.status || 500).json({ success: false, message: err.message });
+});
+
+const PORT = Number(process.env.PAYOUT_MOCK_PORT || 4100);
+bankAccountService.seedFromEnv();
+
+const RANDOM_ACCOUNTS = Number(process.env.RANDOM_ACCOUNT_COUNT || 50);
+if (RANDOM_ACCOUNTS > 0) {
+  const created = bankAccountGenerator.seedRandomAccounts(RANDOM_ACCOUNTS, {
+    prefixBehaviours: true,
+    maxReceivable: true,
+  });
+  console.log(`[PayoutMock] Generated ${created.length} random bank accounts`);
+}
+
+app.listen(PORT, () => {
+  console.log("=================================================");
+  console.log(`  PayoutMock (dummy gateway) on :${PORT}`);
+  console.log(`  Backend webhook target: ${process.env.BACKEND_WEBHOOK_URL}`);
+  console.log(`  Auto callbacks: ${process.env.AUTO_CALLBACK_ENABLED}`);
+  console.log(
+    `  Auto callback delay: ${process.env.AUTO_CALLBACK_DELAY_MS} ms`,
+  );
+  console.log(`  Seeded accounts: ${bankAccountService.listAccounts().length}`);
+  console.log("=================================================");
+  console.log("  Bank lookup     : GET  /bank-accounts/:account");
+  console.log("  Initiate payout : POST /payouts           <- called by backend");
+  console.log("  Payout status   : GET  /payouts/:reference");
+  console.log("  Initiate payin  : POST /payin/create      <- called by backend");
+  console.log("  Checkout page   : GET  /pay/:reference");
+  console.log("  Create refund   : POST /refund/create     <- called by backend");
+  console.log("  Refund status   : GET  /refund/:gatewayRefundId");
+  console.log("  Create CB       : POST /chargeback/create");
+  console.log("  CB accept       : POST /chargeback/:id/accept");
+  console.log("  CB contest      : POST /chargeback/:id/contest");
+  console.log("  CB reverse      : POST /chargeback/:id/reverse");
+  console.log("  CB status       : GET  /chargeback/:id");
+  console.log("  Manual webhook  : POST /webhook/fire      <- testing only");
+  console.log("  Webhook log     : GET  /webhook/log");
+  console.log("=================================================");
+});
+==================== C:\Users\DELL\Documents\DummyGateway\payout-csv.js ====================
+const fs = require("fs");
+const path = require("path");
+
+const COUNTER_FILE = path.join(__dirname, "payout.txt");
+const PREFIX = "PAYOUT-CSV-";
+const PAD = 3;
+
+// ---- payment modes ----
+const PAYMENT_MODES = ["BANK"];
+
+function pick(arr) {
+  return arr[Math.floor(Math.random() * arr.length)];
+}
+
+// ---- read last used counter ----
+let last = 0;
+if (fs.existsSync(COUNTER_FILE)) {
+  const raw = fs.readFileSync(COUNTER_FILE, "utf8").trim();
+  const parsed = parseInt(raw.replace(/\D/g, ""), 10);
+  if (Number.isFinite(parsed)) last = parsed;
+}
+
+const BATCH = 500; // change per run
+const start = last + 1;
+const end = last + BATCH;
+
+const rows = [
+  "amount,merchantReference,paymentMode,beneficiaryName,beneficiaryAccount,beneficiaryIfsc,beneficiaryBank,email,mobile",
+];
+
+for (let i = start; i <= end; i++) {
+  const ref = `${PREFIX}${String(i).padStart(PAD, "0")}`;
+  const mode = pick(PAYMENT_MODES);
+  rows.push(
+    `10,${ref},${mode},Rahul Sharma,1000000001,HDFC0001234,HDFC Bank,rahul@example.com,9876543210`,
+  );
+}
+
+const outFile = `payouts-${start}-${end}.csv`;
+fs.writeFileSync(outFile, rows.join("\n"));
+fs.writeFileSync(COUNTER_FILE, String(end));
+
+console.log(
+  `Generated ${BATCH} rows: ${PREFIX}${String(start).padStart(PAD, "0")} â†’ ${PREFIX}${String(end).padStart(PAD, "0")}`,
+);
+console.log(`CSV  : ${outFile}`);
+console.log(`Next : ${PREFIX}${String(end + 1).padStart(PAD, "0")}`);
+
+==================== C:\Users\DELL\Documents\DummyGateway\routes\bank-accounts.routes.js ====================
+const express = require("express");
+const service = require("../services/bank-account.service");
+
+const router = express.Router();
+
+// IMPORTANT: register fixed paths BEFORE ":account"
+router.get("/", (req, res) => {
+  res.json({
+    success: true,
+    count: service.listAccounts().length,
+    data: service.listAccounts(),
+  });
+});
+
+router.post("/", (req, res) => {
+  try {
+    const record = service.addAccount(req.body);
+    res.status(201).json({ success: true, data: record });
+  } catch (err) {
+    res.status(400).json({ success: false, message: err.message });
+  }
+});
+
+router.post("/verify", (req, res) => {
+  const { account, ifsc, name } = req.body || {};
+  const record = service.getAccount(account);
+  if (!record)
+    return res.json({
+      success: true,
+      valid: false,
+      reason: "ACCOUNT_NOT_FOUND",
+    });
+  if (ifsc && record.ifsc !== String(ifsc).toUpperCase())
+    return res.json({
+      success: true,
+      valid: false,
+      reason: "IFSC_MISMATCH",
+      expected: record.ifsc,
+    });
+  if (name && record.name.toLowerCase() !== String(name).toLowerCase())
+    return res.json({
+      success: true,
+      valid: false,
+      reason: "NAME_MISMATCH",
+      expected: record.name,
+    });
+  res.json({ success: true, valid: true, account: record });
+});
+
+router.get("/meta/behaviours", (req, res) => {
+  res.json({ success: true, data: Array.from(service.VALID_BEHAVIOURS) });
+});
+
+router.get("/:account", (req, res) => {
+  const record = service.getAccount(req.params.account);
+  if (!record)
+    return res
+      .status(404)
+      .json({ success: false, message: "Account not found" });
+  res.json({ success: true, data: record });
+});
+
+router.delete("/:account", (req, res) => {
+  const ok = service.deleteAccount(req.params.account);
+  if (!ok)
+    return res
+      .status(404)
+      .json({ success: false, message: "Account not found" });
+  res.json({ success: true, message: "Deleted" });
+});
+
+module.exports = router;
+
+==================== C:\Users\DELL\Documents\DummyGateway\routes\chargeback.routes.js ====================
+const express = require("express");
+const { v4: uuid } = require("uuid");
+const chargebackStore = require("../services/chargeback-store.service");
+const payinStore = require("../services/payin-store.service");
+const dispatcher = require("../services/webhook-dispatcher.service");
+
+const router = express.Router();
+
+/**
+ * POST /chargeback/create
+ * Called by PayoutMock itself (or you, from Postman) to simulate a new dispute.
+ *
+ * Body: { reference_id, amount, currency, reason, reason_description }
+ */
+router.post("/create", async (req, res) => {
+  try {
+    const { reference_id, amount, currency, reason, reason_description } =
+      req.body || {};
+
+    if (!reference_id) {
+      return res.status(400).json({ success: false, message: "reference_id is required" });
+    }
+
+    const payin = payinStore.getPayin(reference_id);
+    const cbAmount = Number(amount || payin?.amount || 0);
+    if (!cbAmount || cbAmount <= 0) {
+      return res.status(400).json({ success: false, message: "amount is required" });
+    }
+
+    const gatewayChargebackId = `DUMMY_CB_${Date.now()}_${uuid().slice(0, 6)}`;
+
+    chargebackStore.createChargeback({
+      gatewayChargebackId,
+      referenceId: reference_id,
+      amount: cbAmount,
+      currency: currency || "INR",
+      reason: reason || "customer_dispute",
+      reasonDescription: reason_description || null,
+      behaviour: "CHARGEBACK_DISPUTED",
+    });
+
+    // Fire CHARGEBACK_CREATED webhook immediately
+    const delayMs = Number(process.env.AUTO_CALLBACK_DELAY_MS || 5000);
+    const auto = String(process.env.AUTO_CALLBACK_ENABLED || "true") === "true";
+    if (auto) {
+      setTimeout(() => {
+        dispatcher
+          .dispatchChargebackCreated(gatewayChargebackId, {
+            reason: reason || "customer_dispute",
+            amount: cbAmount,
+          })
+          .catch((e) =>
+            console.error("[PayoutMock] chargeback create callback error:", e.message)
+          );
+      }, delayMs);
+    }
+
+    return res.json({
+      success: true,
+      data: {
+        gateway_chargeback_id: gatewayChargebackId,
+        reference_id,
+        amount: cbAmount,
+        currency: currency || "INR",
+        status: "DISPUTED",
+        reason: reason || "customer_dispute",
+        message: auto
+          ? `CHARGEBACK_CREATED webhook in ${delayMs}ms`
+          : "Awaiting manual webhook",
+      },
+    });
+  } catch (error) {
+    console.error("[PayoutMock] /chargeback/create error:", error);
+    res.status(500).json({ success: false, message: error.message });
+  }
+});
+
+/**
+ * POST /chargeback/:id/accept
+ * Called by DummyChargebackIntegrationService.acceptDispute()
+ */
+router.post("/:id/accept", (req, res) => {
+  const cb = chargebackStore.getChargeback(req.params.id);
+  if (!cb) {
+    return res.status(404).json({ success: false, message: "Chargeback not found" });
+  }
+  if (cb.status === "REVERSED") {
+    return res.status(400).json({
+      success: false,
+      message: "Chargeback already reversed",
+      failure_code: "INVALID_STATE",
+    });
+  }
+  chargebackStore.updateChargeback(req.params.id, {
+    status: "ACCEPTED",
+    acceptedAt: new Date().toISOString(),
+  });
+  return res.json({
+    success: true,
+    data: {
+      chargeback_id: req.params.id,
+      status: "ACCEPTED",
+      amount: cb.amount,
+      message: "Dispute accepted by merchant",
+    },
+  });
+});
+
+/**
+ * POST /chargeback/:id/contest
+ * Called by DummyChargebackIntegrationService.contestDispute()
+ *
+ * Body: { evidence: { ... } }
+ */
+router.post("/:id/contest", (req, res) => {
+  const cb = chargebackStore.getChargeback(req.params.id);
+  if (!cb) {
+    return res.status(404).json({ success: false, message: "Chargeback not found" });
+  }
+  if (cb.status === "REVERSED") {
+    return res.status(400).json({
+      success: false,
+      message: "Chargeback already reversed",
+      failure_code: "INVALID_STATE",
+    });
+  }
+  if (cb.status === "ACCEPTED") {
+    return res.status(400).json({
+      success: false,
+      message: "Chargeback already accepted, cannot contest",
+      failure_code: "INVALID_STATE",
+    });
+  }
+  chargebackStore.updateChargeback(req.params.id, {
+    status: "CONTESTED",
+    contestedAt: new Date().toISOString(),
+    evidence: req.body?.evidence || {},
+  });
+  return res.json({
+    success: true,
+    data: {
+      chargeback_id: req.params.id,
+      status: "CONTESTED",
+      amount: cb.amount,
+      message: "Dispute contested with evidence",
+    },
+  });
+});
+
+/**
+ * GET /chargeback/:id
+ * Called by DummyChargebackIntegrationService.fetchDispute()
+ */
+router.get("/:id", (req, res) => {
+  const cb = chargebackStore.getChargeback(req.params.id);
+  if (!cb) {
+    return res.status(404).json({ success: false, message: "Chargeback not found" });
+  }
+  res.json({
+    success: true,
+    data: {
+      chargeback_id: cb.gatewayChargebackId,
+      reference_id: cb.referenceId,
+      amount: cb.amount,
+      currency: cb.currency,
+      status: cb.status,
+      reason: cb.reason,
+      reason_description: cb.reasonDescription,
+      respond_by: new Date(Date.now() + 7 * 24 * 60 * 60 * 1000).toISOString(),
+    },
+  });
+});
+
+/**
+ * POST /chargeback/:id/reverse
+ * Testing convenience â€” fires CHARGEBACK_REVERSED webhook
+ */
+router.post("/:id/reverse", async (req, res) => {
+  try {
+    const cb = chargebackStore.getChargeback(req.params.id);
+    if (!cb) {
+      return res.status(404).json({ success: false, message: "Chargeback not found" });
+    }
+    const reason = req.body?.reason || "Chargeback reversed by bank";
+    const result = await dispatcher.dispatchChargebackReversed(req.params.id, {
+      reason,
+    });
+    return res.json({ success: true, data: { chargeback_id: req.params.id, reason, result } });
+  } catch (error) {
+    res.status(400).json({ success: false, message: error.message });
+  }
+});
+
+/**
+ * GET /chargeback
+ */
+router.get("/", (req, res) => {
+  res.json({
+    success: true,
+    count: chargebackStore.listChargebacks().length,
+    data: chargebackStore.listChargebacks(),
+  });
+});
+
+module.exports = router;
+==================== C:\Users\DELL\Documents\DummyGateway\routes\payin.routes.js ====================
+const express = require("express");
+const { v4: uuid } = require("uuid");
+const bankAccounts = require("../services/bank-account.service");
+const payinStore = require("../services/payin-store.service");
+const dispatcher = require("../services/webhook-dispatcher.service");
+
+const router = express.Router();
+
+/**
+ * POST /payin/create
+ * Called by DummyPayinIntegrationService.initiatePayInRequest()
+ *
+ * Body: { reference_id, amount, currency, payment_mode,
+ *         customer_name, customer_email, customer_phone,
+ *         callback_url, return_url }
+ */
+router.post("/create", async (req, res) => {
+  try {
+    const {
+      reference_id,
+      amount,
+      currency,
+      payment_mode,
+      customer_name,
+      customer_email,
+      customer_phone,
+      return_url,
+    } = req.body || {};
+
+    if (!reference_id) {
+      return res
+        .status(400)
+        .json({ success: false, message: "reference_id is required" });
+    }
+    if (!amount || Number(amount) <= 0) {
+      return res
+        .status(400)
+        .json({ success: false, message: "amount must be > 0" });
+    }
+
+    // Idempotent re-issue
+    const existing = payinStore.getPayin(reference_id);
+    if (existing) {
+      return res.json({
+        success: true,
+        idempotent: true,
+        data: {
+          reference_id: existing.referenceId,
+          gateway_reference: existing.transferId,
+          status: existing.status,
+          amount: existing.amount,
+          checkout_url: `${process.env.PAYOUT_MOCK_URL || "http://localhost:4100"}/pay/${encodeURIComponent(existing.referenceId)}`,
+        },
+      });
+    }
+
+    // Behaviour: first digit of reference_id or default
+    const first = String(reference_id).charAt(0);
+    const behaviour =
+      first === "2" ? "PAYIN_FAIL" : "PAYIN_SUCCESS_AFTER_DELAY";
+
+    const transferId = `DUMMY_PAYIN_${Date.now()}_${uuid().slice(0, 6)}`;
+    const mockBase =
+      process.env.PAYOUT_MOCK_URL ||
+      `http://localhost:${process.env.PAYOUT_MOCK_PORT || 4100}`;
+    const checkoutUrl = `${mockBase}/pay/${encodeURIComponent(reference_id)}`;
+
+    payinStore.createPayin({
+      referenceId: reference_id,
+      transferId,
+      amount: Number(amount),
+      currency: currency || "INR",
+      paymentMode: payment_mode || "PG",
+      customerName: customer_name,
+      customerEmail: customer_email,
+      customerPhone: customer_phone,
+      behaviour,
+    });
+
+    // Read once â€” used by both success and failure paths
+    const delayMs = Number(process.env.AUTO_CALLBACK_DELAY_MS || 0);
+    const auto = String(process.env.AUTO_CALLBACK_ENABLED || "true") === "true";
+
+    // -------- Immediate business failure --------
+    if (behaviour === "PAYIN_FAIL") {
+      payinStore.updatePayin(reference_id, {
+        status: "FAILED",
+        failureReason: "Payment declined by bank",
+        failureCode: "PAYMENT_FAILED",
+      });
+
+      if (auto) {
+        const fireFail = () =>
+          dispatcher
+            .dispatchPayinFailed(reference_id, {
+              reason: "Payment declined by bank",
+              code: "PAYMENT_FAILED",
+            })
+            .catch((e) =>
+              console.error("[PayoutMock] payin fail callback error:", e.message),
+            );
+
+        if (delayMs > 0) setTimeout(fireFail, delayMs);
+        else fireFail();
+      }
+
+      return res.status(200).json({
+        success: false,
+        message: "Payment declined by bank",
+        failure_code: "PAYMENT_FAILED",
+        reference_id: reference_id,
+        gateway_reference: transferId,
+        checkout_url: checkoutUrl,
+        return_url: return_url || null,
+      });
+    }
+
+    // -------- Success path: fire callback (inline when delay=0) --------
+    if (auto) {
+      const fireSuccess = () =>
+        dispatcher
+          .dispatchPayinSuccess(reference_id, { amount: Number(amount) })
+          .catch((e) =>
+            console.error(
+              "[PayoutMock] payin success callback error:",
+              e.message,
+            ),
+          );
+
+      if (delayMs > 0) setTimeout(fireSuccess, delayMs);
+      else fireSuccess();
+    }
+
+    return res.json({
+      success: true,
+      data: {
+        reference_id: reference_id,
+        gateway_reference: transferId,
+        status: "PROCESSING",
+        amount: Number(amount),
+        currency: currency || "INR",
+        checkout_url: checkoutUrl,
+        return_url: return_url || null,
+        message: auto
+          ? delayMs > 0
+            ? `Callback scheduled in ${delayMs}ms`
+            : "Callback fired immediately"
+          : "Awaiting manual webhook via POST /webhook/fire",
+      },
+    });
+  } catch (error) {
+    console.error("[PayoutMock] /payin/create error:", error);
+    res.status(500).json({ success: false, message: error.message });
+  }
+});
+
+/**
+ * GET /payin/:reference
+ * Called by DummyPayinIntegrationService.checkStatus()
+ */
+router.get("/:reference", (req, res) => {
+  const record = payinStore.getPayin(req.params.reference);
+  if (!record) {
+    return res.status(404).json({ success: false, message: "Payin not found" });
+  }
+  res.json({
+    success: true,
+    data: {
+      reference_id: record.referenceId,
+      gateway_reference: record.transferId,
+      status:
+        record.status === "COMPLETED"
+          ? "SUCCESS"
+          : record.status === "FAILED"
+            ? "FAILED"
+            : "PENDING",
+      amount: record.amount,
+      currency: record.currency,
+      utr: record.utr,
+      failure_reason: record.failureReason,
+      failure_code: record.failureCode,
+    },
+  });
+});
+
+/**
+ * GET /payin (list)
+ */
+router.get("/", (req, res) => {
+  res.json({
+    success: true,
+    count: payinStore.listPayins().length,
+    data: payinStore.listPayins(),
+  });
+});
+
+module.exports = router;
+==================== C:\Users\DELL\Documents\DummyGateway\routes\payouts.routes.js ====================
+const express = require("express");
+const { v4: uuid } = require("uuid");
+const bankAccounts = require("../services/bank-account.service");
+const payoutStore = require("../services/payout-store.service");
+const dispatcher = require("../services/webhook-dispatcher.service");
+
+const router = express.Router();
+
+/**
+ * POST /payouts
+ * Called by fintech-backend's DummyPayoutIntegrationService.
+ *
+ * Behaviour: PENDING immediately + auto webhook fires right away
+ * (controlled by AUTO_CALLBACK_ENABLED / AUTO_CALLBACK_DELAY_MS).
+ */
+router.post("/", async (req, res) => {
+  try {
+    const {
+      reference_id,
+      transfer_amount,
+      beneficiary_account,
+      beneficiary_ifsc,
+      beneficiary_name,
+      idempotency_key,
+    } = req.body || {};
+
+    if (!reference_id) {
+      return res
+        .status(400)
+        .json({ success: false, message: "reference_id is required" });
+    }
+    if (!transfer_amount || Number(transfer_amount) <= 0) {
+      return res
+        .status(400)
+        .json({ success: false, message: "transfer_amount must be > 0" });
+    }
+
+    // Idempotency: if this reference is already known, return same result
+    const existing = payoutStore.getPayout(reference_id);
+    if (existing) {
+      return res.json({
+        success: true,
+        idempotent: true,
+        data: {
+          reference_id: existing.referenceId,
+          transfer_id: existing.transferId,
+          transfer_status:
+            existing.status === "COMPLETED"
+              ? "SUCCESS"
+              : existing.status === "FAILED"
+                ? "FAILED"
+                : "PENDING",
+          transfer_amount: existing.amount,
+          bank_reference: existing.utr,
+          failure_reason: existing.failureReason,
+          failure_code: existing.failureCode,
+        },
+      });
+    }
+
+    const transferId = `DUMMY_${Date.now()}_${uuid().slice(0, 6)}`;
+    const account = bankAccounts.getAccount(beneficiary_account);
+
+    // ---------- Decide behaviour ----------
+    let behaviour = account?.behaviour || null;
+    if (!behaviour) {
+      const first = String(beneficiary_account || "").charAt(0);
+      behaviour =
+        first === "2"
+          ? "BUSINESS_FAIL"
+          : first === "5"
+            ? "TIMEOUT"
+            : first === "6"
+              ? "RETRY_503"
+              : first === "7"
+                ? "NEVER_CALLBACK"
+                : first === "4"
+                  ? "PENDING_THEN_FAIL"
+                  : "PENDING_THEN_SUCCESS";
+    }
+
+    // Save record
+    payoutStore.createPayout({
+      referenceId: reference_id,
+      transferId,
+      amount: Number(transfer_amount),
+      accountNumber: beneficiary_account,
+      beneficiaryName: beneficiary_name,
+      ifsc: beneficiary_ifsc,
+      bank: account?.bank || "Unknown",
+      behaviour,
+    });
+
+    const fail = (reason, code, extra = {}) => {
+      payoutStore.updatePayout(reference_id, {
+        status: "FAILED",
+        failureReason: reason,
+        failureCode: code,
+      });
+      const data = {
+        transfer_id: transferId,
+        transfer_status: "FAILED",
+        transfer_amount: Number(transfer_amount),
+        reference_id: reference_id,
+        failure_reason: reason,
+        failure_code: code,
+        ...extra,
+      };
+      return res.json({ success: true, data });
+    };
+
+    // ---------- Validation ----------
+    const ifsc = beneficiary_ifsc ? String(beneficiary_ifsc).toUpperCase() : "";
+    if (!/^[A-Z]{4}0[A-Z0-9]{6}$/.test(ifsc)) {
+      return fail(`Invalid IFSC: ${beneficiary_ifsc}`, "BENEFICIARY_INVALID");
+    }
+    if (!account) {
+      return fail(
+        `Beneficiary account not found: ${beneficiary_account}`,
+        "BENEFICIARY_INVALID",
+      );
+    }
+    if (account.ifsc && account.ifsc.toUpperCase() !== ifsc) {
+      return fail(
+        `IFSC mismatch. Expected ${account.ifsc}, got ${ifsc}`,
+        "BENEFICIARY_INVALID",
+      );
+    }
+    if (
+      Number(account.maxReceivable || 0) > 0 &&
+      Number(transfer_amount) > Number(account.maxReceivable)
+    ) {
+      return fail(
+        `Amount ${transfer_amount} exceeds bank limit ${account.maxReceivable}`,
+        "TRANSACTION_LIMIT_EXCEEDED",
+      );
+    }
+
+    // ---------- TIMEOUT ----------
+    if (behaviour === "TIMEOUT") {
+      return res.status(504).json({
+        success: false,
+        message: "Gateway timeout",
+        transfer_id: transferId,
+      });
+    }
+
+    // ---------- RETRY_503 ----------
+    if (behaviour === "RETRY_503") {
+      return res.status(503).json({
+        success: false,
+        message: "Dummy gateway temporarily unavailable",
+        failure_code: "SERVICE_UNAVAILABLE",
+        transfer_id: transferId,
+      });
+    }
+
+    // ---------- BUSINESS_FAIL ----------
+    if (behaviour === "BUSINESS_FAIL") {
+      return fail("Beneficiary account blocked by bank", "BENEFICIARY_INVALID");
+    }
+
+    // ---------- PENDING + auto webhook ----------
+    const delayMs = Number(process.env.AUTO_CALLBACK_DELAY_MS || 0);
+    const auto = String(process.env.AUTO_CALLBACK_ENABLED || "true") === "true";
+
+    const fireWebhook = () => {
+      if (behaviour === "PENDING_THEN_SUCCESS") {
+        dispatcher
+          .dispatchPayoutSuccess(reference_id, {
+            amount: Number(transfer_amount),
+          })
+          .catch((e) =>
+            console.error("[PayoutMock] auto success callback failed:", e.message),
+          );
+      } else if (behaviour === "PENDING_THEN_FAIL") {
+        dispatcher
+          .dispatchPayoutFailed(reference_id, {
+            amount: Number(transfer_amount),
+          })
+          .catch((e) =>
+            console.error("[PayoutMock] auto fail callback failed:", e.message),
+          );
+      }
+    };
+
+    if (auto && behaviour !== "NEVER_CALLBACK") {
+      if (delayMs > 0) {
+        setTimeout(fireWebhook, delayMs);
+      } else {
+        // Fire immediately (fire-and-forget; response is not blocked)
+        fireWebhook();
+      }
+    }
+
+    return res.json({
+      success: true,
+      data: {
+        transfer_id: transferId,
+        transfer_status: "PENDING",
+        transfer_amount: Number(transfer_amount),
+        reference_id: reference_id,
+        idempotency_key: idempotency_key || null,
+        behaviour,
+        message:
+          auto && behaviour !== "NEVER_CALLBACK"
+            ? delayMs > 0
+              ? `Callback scheduled in ${delayMs}ms`
+              : "Callback fired immediately"
+            : "Awaiting manual webhook",
+      },
+    });
+  } catch (error) {
+    console.error("[PayoutMock] /payouts error:", error);
+    res.status(500).json({ success: false, message: error.message });
+  }
+});
+
+/**
+ * GET /payouts
+ */
+router.get("/", (req, res) => {
+  res.json({
+    success: true,
+    count: payoutStore.listPayouts().length,
+    data: payoutStore.listPayouts(),
+  });
+});
+
+/**
+ * GET /payouts/:reference
+ */
+router.get("/:reference", (req, res) => {
+  const record = payoutStore.getPayout(req.params.reference);
+  if (!record) {
+    return res
+      .status(404)
+      .json({ success: false, message: "Payout not found" });
+  }
+  res.json({
+    success: true,
+    data: {
+      reference_id: record.referenceId,
+      transfer_id: record.transferId,
+      transfer_status:
+        record.status === "COMPLETED"
+          ? "SUCCESS"
+          : record.status === "FAILED"
+            ? "FAILED"
+            : "PENDING",
+      transfer_amount: record.amount,
+      bank_reference: record.utr,
+      failure_reason: record.failureReason,
+      failure_code: record.failureCode,
+      behaviour: record.behaviour,
+    },
+  });
+});
+
+module.exports = router;
+==================== C:\Users\DELL\Documents\DummyGateway\routes\refund.routes.js ====================
+const express = require("express");
+const { v4: uuid } = require("uuid");
+const refundStore = require("../services/refund-store.service");
+const payinStore = require("../services/payin-store.service");
+const dispatcher = require("../services/webhook-dispatcher.service");
+
+const router = express.Router();
+
+/**
+ * POST /refund/create
+ * Called by DummyRefundIntegrationService.createRefund()
+ *
+ * Body: { gateway_reference, reference_id, refund_local_id,
+ *         refund_amount, refund_note, callback_url }
+ */
+router.post("/create", async (req, res) => {
+  try {
+    const {
+      gateway_reference,
+      reference_id,
+      refund_local_id,
+      refund_amount,
+      refund_note,
+    } = req.body || {};
+
+    if (!gateway_reference) {
+      return res.status(400).json({ success: false, message: "gateway_reference is required" });
+    }
+    if (!refund_amount || Number(refund_amount) <= 0) {
+      return res.status(400).json({ success: false, message: "refund_amount must be > 0" });
+    }
+
+    // Find the original payin (for behaviour + original amount check)
+    const payin = reference_id ? payinStore.getPayin(reference_id) : null;
+
+    // Behaviour by first char of reference_id: 4 = REFUND_FAIL, else success
+    const first = String(reference_id || "").charAt(0);
+    const behaviour = first === "4" ? "REFUND_FAIL" : "REFUND_SUCCESS";
+
+    // Guard: refund amount can't exceed original
+    const originalAmount = payin?.amount ?? Number(refund_amount);
+    if (Number(refund_amount) > originalAmount) {
+      return res.status(400).json({
+        success: false,
+        message: `Refund amount ${refund_amount} exceeds original amount ${originalAmount}`,
+        failure_code: "REFUND_AMOUNT_EXCEEDED",
+      });
+    }
+
+    const gatewayRefundId = `DUMMY_RFND_${Date.now()}_${uuid().slice(0, 6)}`;
+
+    refundStore.createRefund({
+      gatewayRefundId,
+      localRefundId: refund_local_id || null,
+      referenceId: reference_id || null,
+      amount: Number(refund_amount),
+      currency: "INR",
+      note: refund_note || "Refund initiated by admin",
+      behaviour,
+    });
+
+    const delayMs = Number(process.env.AUTO_CALLBACK_DELAY_MS || 5000);
+    const auto = String(process.env.AUTO_CALLBACK_ENABLED || "true") === "true";
+
+    if (auto) {
+      if (behaviour === "REFUND_FAIL") {
+        setTimeout(() => {
+          dispatcher
+            .dispatchRefundFailed(gatewayRefundId, {
+              reason: "Refund declined by bank",
+              code: "REFUND_DECLINED",
+            })
+            .catch((e) =>
+              console.error("[PayoutMock] refund fail callback error:", e.message)
+            );
+        }, delayMs);
+      } else {
+        setTimeout(() => {
+          dispatcher
+            .dispatchRefundSuccess(gatewayRefundId)
+            .catch((e) =>
+              console.error("[PayoutMock] refund success callback error:", e.message)
+            );
+        }, delayMs);
+      }
+    }
+
+    return res.json({
+      success: true,
+      data: {
+        gateway_refund_id: gatewayRefundId,
+        refund_local_id: refund_local_id || null,
+        reference_id: reference_id || null,
+        status: "PENDING",
+        refund_amount: Number(refund_amount),
+        currency: "INR",
+        behaviour,
+        message: auto
+          ? `Callback scheduled in ${delayMs}ms`
+          : "Awaiting manual webhook via POST /webhook/fire",
+      },
+    });
+  } catch (error) {
+    console.error("[PayoutMock] /refund/create error:", error);
+    res.status(500).json({ success: false, message: error.message });
+  }
+});
+
+/**
+ * GET /refund/:gatewayRefundId
+ * Called by DummyRefundIntegrationService.fetchRefund()
+ */
+router.get("/:gatewayRefundId", (req, res) => {
+  const record = refundStore.getRefund(req.params.gatewayRefundId);
+  if (!record) {
+    return res.status(404).json({ success: false, message: "Refund not found" });
+  }
+  res.json({
+    success: true,
+    data: {
+      gateway_refund_id: record.gatewayRefundId,
+      refund_local_id: record.localRefundId,
+      reference_id: record.referenceId,
+      refund_amount: record.amount,
+      currency: record.currency,
+      status:
+        record.status === "COMPLETED"
+          ? "SUCCESS"
+          : record.status === "FAILED"
+            ? "FAILED"
+            : "PENDING",
+      failure_reason: record.failureReason,
+      failure_code: record.failureCode,
+    },
+  });
+});
+
+/**
+ * GET /refund
+ */
+router.get("/", (req, res) => {
+  res.json({
+    success: true,
+    count: refundStore.listRefunds().length,
+    data: refundStore.listRefunds(),
+  });
+});
+
+module.exports = router;
+==================== C:\Users\DELL\Documents\DummyGateway\routes\webhook-trigger.routes.js ====================
+const express = require("express");
+const payoutStore = require("../services/payout-store.service");
+const dispatcher = require("../services/webhook-dispatcher.service");
+
+const router = express.Router();
+
+/**
+ * POST /webhook/fire  â€” manual trigger (testing only)
+ */
+router.post("/fire", async (req, res) => {
+  try {
+    const {
+      reference_id,
+      gateway_refund_id,
+      chargeback_id,
+      event = "PAYOUT_SUCCESS",
+      utr,
+      amount,
+      failure_reason,
+      failure_code,
+      delay_seconds = 0,
+      duplicate = false,
+    } = req.body || {};
+
+    const payoutEvents = ["PAYOUT_SUCCESS", "PAYOUT_FAILED", "PAYOUT_PENDING"];
+    const payinEvents = [
+      "PAYIN_SUCCESS",
+      "PAYIN_FAILED",
+      "PAYMENT_SUCCESS",
+      "PAYMENT_FAILED",
+    ];
+    const refundEvents = ["REFUND_SUCCESS", "REFUND_FAILED"];
+    const chargebackEvents = ["CHARGEBACK_CREATED", "CHARGEBACK_REVERSED"];
+
+    if (
+      (payoutEvents.includes(event) || payinEvents.includes(event)) &&
+      !reference_id
+    ) {
+      return res
+        .status(400)
+        .json({ success: false, message: "reference_id is required for this event" });
+    }
+    if (refundEvents.includes(event) && !gateway_refund_id) {
+      return res.status(400).json({
+        success: false,
+        message: "gateway_refund_id is required for this event",
+      });
+    }
+    if (chargebackEvents.includes(event) && !chargeback_id) {
+      return res.status(400).json({
+        success: false,
+        message: "chargeback_id is required for this event",
+      });
+    }
+
+    const fireOnce = async () => {
+      switch (event) {
+        case "PAYOUT_SUCCESS":
+          return dispatcher.dispatchPayoutSuccess(reference_id, { utr, amount });
+        case "PAYOUT_FAILED":
+          return dispatcher.dispatchPayoutFailed(reference_id, {
+            reason: failure_reason,
+            code: failure_code,
+            amount,
+          });
+        case "PAYOUT_PENDING":
+          return dispatcher.dispatchPayoutPending(reference_id);
+        case "PAYIN_SUCCESS":
+        case "PAYMENT_SUCCESS":
+          return dispatcher.dispatchPayinSuccess(reference_id, { utr, amount });
+        case "PAYIN_FAILED":
+        case "PAYMENT_FAILED":
+          return dispatcher.dispatchPayinFailed(reference_id, {
+            reason: failure_reason,
+            code: failure_code,
+            amount,
+          });
+        case "REFUND_SUCCESS":
+          return dispatcher.dispatchRefundSuccess(gateway_refund_id);
+        case "REFUND_FAILED":
+          return dispatcher.dispatchRefundFailed(gateway_refund_id, {
+            reason: failure_reason,
+            code: failure_code,
+          });
+        case "CHARGEBACK_CREATED":
+          return dispatcher.dispatchChargebackCreated(chargeback_id, {
+            reason: failure_reason,
+            amount,
+          });
+        case "CHARGEBACK_REVERSED":
+          return dispatcher.dispatchChargebackReversed(chargeback_id, {
+            reason: failure_reason,
+          });
+        default:
+          throw new Error(`Unknown event: ${event}`);
+      }
+    };
+
+    if (Number(delay_seconds) > 0) {
+      const ms = Number(delay_seconds) * 1000;
+      setTimeout(() => {
+        fireOnce().catch((e) =>
+          console.error("[manual fire] delayed failed:", e.message),
+        );
+        if (duplicate) {
+          setTimeout(() => {
+            fireOnce().catch((e) =>
+              console.error("[manual fire] delayed duplicate failed:", e.message),
+            );
+          }, 2000);
+        }
+      }, ms);
+      return res.json({
+        success: true,
+        scheduled: true,
+        delaySeconds: Number(delay_seconds),
+        duplicate,
+        event,
+      });
+    }
+
+    const result = await fireOnce();
+    let duplicateResult = null;
+    if (duplicate) {
+      await new Promise((r) => setTimeout(r, 2000));
+      duplicateResult = await fireOnce();
+    }
+
+    return res.json({
+      success: true,
+      event,
+      reference_id,
+      gateway_refund_id,
+      chargeback_id,
+      result,
+      duplicate: duplicateResult,
+    });
+  } catch (error) {
+    return res.status(400).json({
+      success: false,
+      message: error.message,
+      detail: error.result || null,
+    });
+  }
+});
+
+router.get("/log", (req, res) => {
+  const limit = Number(req.query.limit || 50);
+  res.json({ success: true, data: payoutStore.getWebhookLog(limit) });
+});
+
+router.get("/target", (req, res) => {
+  res.json({
+    success: true,
+    backendUrl: process.env.BACKEND_WEBHOOK_URL,
+    hasSecret: Boolean(process.env.DUMMY_WEBHOOK_SECRET),
+    autoCallbacks: String(process.env.AUTO_CALLBACK_ENABLED || "true") === "true",
+    autoCallbackDelayMs: Number(process.env.AUTO_CALLBACK_DELAY_MS || 0),
+  });
+});
+
+module.exports = router;
+==================== C:\Users\DELL\Documents\DummyGateway\services\bank-account-generator.js ====================
+const bankAccountService = require("./bank-account.service");
+
+// ---- data pools ----
+const FIRST_NAMES = [
+  "Emma",
+  "Rahul",
+  "Aarav",
+  "Priya",
+  "Arjun",
+  "Sneha",
+  "Vikram",
+  "Ananya",
+  "Rohan",
+  "Neha",
+  "Karan",
+  "Pooja",
+  "Aditya",
+  "Isha",
+  "Siddharth",
+  "Divya",
+  "Manish",
+  "Kavya",
+  "Nikhil",
+  "Riya",
+  "Amit",
+  "Tara",
+  "Varun",
+  "Meera",
+  "Sanjay",
+  "Anjali",
+  "Rajesh",
+  "Kritika",
+  "Deepak",
+  "Shreya",
+];
+const LAST_NAMES = [
+  "Wilson",
+  "Sharma",
+  "Patel",
+  "Gupta",
+  "Singh",
+  "Kumar",
+  "Verma",
+  "Reddy",
+  "Nair",
+  "Iyer",
+  "Joshi",
+  "Mehta",
+  "Desai",
+  "Kapoor",
+  "Malhotra",
+  "Bhat",
+  "Rao",
+  "Chopra",
+  "Saxena",
+  "Agarwal",
+  "Shah",
+  "Pillai",
+  "Kulkarni",
+  "Mishra",
+  "Yadav",
+  "Trivedi",
+  "Bansal",
+  "Khanna",
+  "Menon",
+  "Das",
+];
+
+// Real-ish bank codes + a valid IFSC pattern: 4 letters + 0 + 6 alnum
+const BANKS = [
+  { code: "HDFC", name: "HDFC Bank" },
+  { code: "ICIC", name: "ICICI Bank" },
+  { code: "SBIN", name: "State Bank of India" },
+  { code: "AXIS", name: "Axis Bank" },
+  { code: "KKBK", name: "Kotak Mahindra Bank" },
+  { code: "PUNB", name: "Punjab National Bank" },
+  { code: "UTIB", name: "Axis Bank (UTIB)" },
+  { code: "YESB", name: "Yes Bank" },
+  { code: "IDFB", name: "IDFC First Bank" },
+  { code: "BARB", name: "Bank of Baroda" },
+];
+
+const BEHAVIOURS = [
+  "PENDING_THEN_SUCCESS",
+  "PENDING_THEN_SUCCESS",
+  "PENDING_THEN_SUCCESS", // weighted toward success
+  "BUSINESS_FAIL",
+  "PENDING_THEN_FAIL",
+  "TIMEOUT",
+  "RETRY_503",
+  "NEVER_CALLBACK",
+];
+
+// ---- helpers ----
+function randInt(min, max) {
+  return min + Math.floor(Math.random() * (max - min + 1));
+}
+function pick(arr) {
+  return arr[Math.floor(Math.random() * arr.length)];
+}
+
+function randomName() {
+  return `${pick(FIRST_NAMES)} ${pick(LAST_NAMES)}`;
+}
+
+function randomAccountNumber(prefix = "") {
+  // 10-digit account number. First digit optionally overrides behaviour.
+  // Prefix "1" -> PENDING_THEN_SUCCESS, "2" -> BUSINESS_FAIL, etc. (see routes/payouts.routes.js)
+  let num = "";
+  for (let i = 0; i < 10; i++) num += randInt(0, 9);
+  if (prefix) num = prefix + num.slice(1);
+  return num;
+}
+
+function randomIfsc(bank) {
+  // 4 letters + '0' + 6 alnum  (valid IFSC format)
+  let suffix = "";
+  const chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+  for (let i = 0; i < 6; i++) suffix += chars[randInt(0, chars.length - 1)];
+  return `${bank.code}0${suffix}`;
+}
+
+function randomMaxReceivable() {
+  // 0 = no limit; otherwise 50kâ€“5L
+  const useLimit = Math.random() < 0.5;
+  if (!useLimit) return 0;
+  return randInt(50, 500) * 1000; // 50000..500000, multiple of 1000
+}
+
+/**
+ * Seed N random accounts into bankAccountService (in-memory).
+ * Skips accounts that already exist (idempotent).
+ */
+function seedRandomAccounts(count = 50, options = {}) {
+  const { prefixBehaviours = true, maxReceivable = true } = options;
+  const created = [];
+
+  for (let i = 0; i < count; i++) {
+    const bank = pick(BANKS);
+    const name = randomName();
+    const ifsc = randomIfsc(bank);
+
+    // If prefixBehaviours=true, first digit of account encodes behaviour
+    // so the payout route picks it up from the account number itself.
+    let prefix = "";
+    if (prefixBehaviours) {
+      // distribution: mostly "1" (success), some "2"/"4"/"5"/"6"/"7"
+      const r = Math.random();
+      prefix =
+        r < 0.6
+          ? "1"
+          : r < 0.7
+            ? "2"
+            : r < 0.8
+              ? "4"
+              : r < 0.88
+                ? "5"
+                : r < 0.94
+                  ? "6"
+                  : "7";
+    }
+
+    const account = randomAccountNumber(prefix);
+    if (bankAccountService.getAccount(account)) continue; // avoid dup
+
+    const record = {
+      account,
+      name,
+      ifsc,
+      bank: bank.name,
+      // Behaviour stored on the account also drives mock decisions
+      behaviour: pick(BEHAVIOURS),
+      maxReceivable: maxReceivable ? randomMaxReceivable() : 0,
+    };
+
+    try {
+      bankAccountService.addAccount(record);
+      created.push(record);
+    } catch (err) {
+      // silently skip invalid
+    }
+  }
+
+  return created;
+}
+
+/**
+ * Get a random *existing* account (useful for CSV generators).
+ */
+function pickRandomAccount() {
+  const all = bankAccountService.listAccounts();
+  return all.length ? pick(all) : null;
+}
+
+module.exports = { seedRandomAccounts, pickRandomAccount };
+
+==================== C:\Users\DELL\Documents\DummyGateway\services\bank-account.service.js ====================
+const state = {
+  accounts: new Map(),
+};
+
+const VALID_BEHAVIOURS = new Set([
+  "SUCCESS",
+  "BUSINESS_FAIL",
+  "TIMEOUT",
+  "RETRY_503",
+  "PENDING_THEN_SUCCESS",
+  "PENDING_THEN_FAIL",
+  "NEVER_CALLBACK",
+]);
+
+function parseSeedLine(line) {
+  if (!line) return null;
+  const parts = String(line).split("|").map((p) => p.trim());
+  if (parts.length < 4) return null;
+  const [account, name, ifsc, bank, behaviour, maxReceivable] = parts;
+  if (!account || !name || !ifsc || !bank) return null;
+  return {
+    account: String(account),
+    name: String(name),
+    ifsc: String(ifsc).toUpperCase(),
+    bank: String(bank),
+    behaviour: behaviour ? String(behaviour).toUpperCase() : "PENDING_THEN_SUCCESS",
+    maxReceivable: maxReceivable ? Number(maxReceivable) : 0,
+    createdAt: new Date().toISOString(),
+  };
+}
+
+function seedFromEnv() {
+  const record = parseSeedLine(process.env.SEED_ACCOUNT);
+  if (record) {
+    state.accounts.set(record.account, record);
+    console.log(`[PayoutMock] Seeded account ${record.account} (${record.behaviour})`);
+  }
+}
+
+function listAccounts() {
+  return Array.from(state.accounts.values());
+}
+
+function getAccount(account) {
+  if (!account) return null;
+  return state.accounts.get(String(account)) || null;
+}
+
+function addAccount(input) {
+  if (!input || !input.account) throw new Error("account is required");
+  const account = String(input.account);
+  const name = String(input.name || "").trim();
+  const ifsc = String(input.ifsc || "").toUpperCase().trim();
+  const bank = String(input.bank || "").trim();
+  const behaviour = String(input.behaviour || "PENDING_THEN_SUCCESS").toUpperCase();
+  const maxReceivable = Number(input.maxReceivable || 0);
+
+  if (!name) throw new Error("name is required");
+  if (!/^[A-Z]{4}0[A-Z0-9]{6}$/.test(ifsc)) throw new Error("invalid ifsc");
+  if (!bank) throw new Error("bank is required");
+  if (!VALID_BEHAVIOURS.has(behaviour)) throw new Error("invalid behaviour");
+
+  const record = {
+    account, name, ifsc, bank, behaviour,
+    maxReceivable: Number.isFinite(maxReceivable) ? maxReceivable : 0,
+    createdAt: new Date().toISOString(),
+  };
+  state.accounts.set(account, record);
+  return record;
+}
+
+function deleteAccount(account) {
+  return state.accounts.delete(String(account));
+}
+
+module.exports = {
+  seedFromEnv, listAccounts, getAccount, addAccount, deleteAccount,
+  VALID_BEHAVIOURS,
+};
+==================== C:\Users\DELL\Documents\DummyGateway\services\chargeback-store.service.js ====================
+const state = {
+  chargebacks: new Map(), // gateway_chargeback_id -> chargeback record
+};
+
+function createChargeback({
+  gatewayChargebackId,
+  referenceId,
+  amount,
+  currency,
+  reason,
+  reasonDescription,
+  behaviour,
+}) {
+  const record = {
+    gatewayChargebackId,
+    referenceId,
+    amount: Number(amount),
+    currency: currency || "INR",
+    reason,
+    reasonDescription,
+    behaviour,
+    status: "DISPUTED",
+    acceptedAt: null,
+    contestedAt: null,
+    reversedAt: null,
+    evidence: null,
+    createdAt: new Date().toISOString(),
+    updatedAt: new Date().toISOString(),
+  };
+  state.chargebacks.set(gatewayChargebackId, record);
+  return record;
+}
+
+function updateChargeback(gatewayChargebackId, patch) {
+  const existing = state.chargebacks.get(gatewayChargebackId);
+  if (!existing) return null;
+  const updated = { ...existing, ...patch, updatedAt: new Date().toISOString() };
+  state.chargebacks.set(gatewayChargebackId, updated);
+  return updated;
+}
+
+function getChargeback(gatewayChargebackId) {
+  return state.chargebacks.get(gatewayChargebackId) || null;
+}
+
+function listChargebacks() {
+  return Array.from(state.chargebacks.values());
+}
+
+module.exports = {
+  createChargeback,
+  updateChargeback,
+  getChargeback,
+  listChargebacks,
+};
+==================== C:\Users\DELL\Documents\DummyGateway\services\payin-store.service.js ====================
+const state = {
+  payins: new Map(), // reference_id -> payin record
+};
+
+function createPayin({
+  referenceId,
+  transferId,
+  amount,
+  currency,
+  paymentMode,
+  customerName,
+  customerEmail,
+  customerPhone,
+  behaviour,
+}) {
+  const record = {
+    referenceId,
+    transferId,
+    amount: Number(amount),
+    currency: currency || "INR",
+    paymentMode: paymentMode || "PG",
+    customerName,
+    customerEmail,
+    customerPhone,
+    behaviour,
+    status: "PENDING",
+    utr: null,
+    failureReason: null,
+    failureCode: null,
+    createdAt: new Date().toISOString(),
+    updatedAt: new Date().toISOString(),
+  };
+  state.payins.set(referenceId, record);
+  return record;
+}
+
+function updatePayin(referenceId, patch) {
+  const existing = state.payins.get(referenceId);
+  if (!existing) return null;
+  const updated = { ...existing, ...patch, updatedAt: new Date().toISOString() };
+  state.payins.set(referenceId, updated);
+  return updated;
+}
+
+function getPayin(referenceId) {
+  return state.payins.get(referenceId) || null;
+}
+
+function listPayins() {
+  return Array.from(state.payins.values());
+}
+
+module.exports = {
+  createPayin,
+  updatePayin,
+  getPayin,
+  listPayins,
+};
+==================== C:\Users\DELL\Documents\DummyGateway\services\payout-store.service.js ====================
+const state = {
+  payouts: new Map(),   // reference_id -> payout record
+  webhookLog: [],
+};
+
+function createPayout({
+  referenceId, transferId, amount, accountNumber, beneficiaryName,
+  ifsc, bank, behaviour,
+}) {
+  const record = {
+    referenceId,
+    transferId,
+    amount: Number(amount),
+    accountNumber,
+    beneficiaryName,
+    ifsc,
+    bank,
+    behaviour,
+    status: "PENDING",
+    utr: null,
+    failureReason: null,
+    failureCode: null,
+    createdAt: new Date().toISOString(),
+    updatedAt: new Date().toISOString(),
+  };
+  state.payouts.set(referenceId, record);
+  return record;
+}
+
+function updatePayout(referenceId, patch) {
+  const existing = state.payouts.get(referenceId);
+  if (!existing) return null;
+  const updated = { ...existing, ...patch, updatedAt: new Date().toISOString() };
+  state.payouts.set(referenceId, updated);
+  return updated;
+}
+
+function getPayout(referenceId) {
+  return state.payouts.get(referenceId) || null;
+}
+
+function listPayouts() {
+  return Array.from(state.payouts.values());
+}
+
+function logWebhook(entry) {
+  state.webhookLog.unshift({ ...entry, at: new Date().toISOString() });
+  if (state.webhookLog.length > 200) state.webhookLog.pop();
+}
+
+function getWebhookLog(limit = 50) {
+  return state.webhookLog.slice(0, limit);
+}
+
+module.exports = {
+  createPayout, updatePayout, getPayout, listPayouts,
+  logWebhook, getWebhookLog,
+};
+==================== C:\Users\DELL\Documents\DummyGateway\services\refund-store.service.js ====================
+const state = {
+  refunds: new Map(), // gateway_refund_id -> refund record
+};
+
+function createRefund({
+  gatewayRefundId,
+  localRefundId,
+  referenceId,
+  amount,
+  currency,
+  note,
+  behaviour,
+}) {
+  const record = {
+    gatewayRefundId,
+    localRefundId,
+    referenceId,
+    amount: Number(amount),
+    currency: currency || "INR",
+    note,
+    behaviour,
+    status: "PENDING",
+    failureReason: null,
+    failureCode: null,
+    createdAt: new Date().toISOString(),
+    updatedAt: new Date().toISOString(),
+  };
+  state.refunds.set(gatewayRefundId, record);
+  return record;
+}
+
+function updateRefund(gatewayRefundId, patch) {
+  const existing = state.refunds.get(gatewayRefundId);
+  if (!existing) return null;
+  const updated = { ...existing, ...patch, updatedAt: new Date().toISOString() };
+  state.refunds.set(gatewayRefundId, updated);
+  return updated;
+}
+
+function getRefund(gatewayRefundId) {
+  return state.refunds.get(gatewayRefundId) || null;
+}
+
+function listRefunds() {
+  return Array.from(state.refunds.values());
+}
+
+module.exports = {
+  createRefund,
+  updateRefund,
+  getRefund,
+  listRefunds,
+};
+==================== C:\Users\DELL\Documents\DummyGateway\services\webhook-dispatcher.service.js ====================
+const axios = require("axios");
+const crypto = require("crypto");
+const payoutStore = require("./payout-store.service");
+
+const BACKEND_URL =
+  process.env.BACKEND_WEBHOOK_URL || "http://localhost:4000/api/webhooks/dummy";
+const SECRET = process.env.DUMMY_WEBHOOK_SECRET || "dummy-webhook-secret";
+
+function sign(payload) {
+  return crypto
+    .createHmac("sha256", SECRET)
+    .update(JSON.stringify(payload))
+    .digest("hex");
+}
+
+async function postWebhook(payload) {
+  const signature = sign(payload);
+  const started = Date.now();
+  try {
+    const response = await axios.post(BACKEND_URL, payload, {
+      headers: {
+        "Content-Type": "application/json",
+        "x-dummy-signature": signature,
+        "x-webhook-signature": signature,
+      },
+      timeout: 10000,
+      validateStatus: () => true,
+    });
+    const result = {
+      ok: response.status >= 200 && response.status < 300,
+      httpStatus: response.status,
+      responseBody: response.data,
+      latencyMs: Date.now() - started,
+    };
+    payoutStore.logWebhook({ event: payload.event, payload, result });
+    console.log(
+      `[PayoutMock] Webhook ${payload.event} â†’ ${BACKEND_URL} â†’ HTTP ${response.status} (${result.latencyMs}ms)`,
+    );
+    return result;
+  } catch (error) {
+    const result = {
+      ok: false,
+      httpStatus: 0,
+      responseBody: error.message,
+      latencyMs: Date.now() - started,
+    };
+    payoutStore.logWebhook({
+      event: payload.event,
+      payload,
+      result,
+      error: true,
+    });
+    console.error(
+      `[PayoutMock] Webhook ${payload.event} FAILED â†’ ${BACKEND_URL}: ${error.message}`,
+    );
+    throw Object.assign(error, { result });
+  }
+}
+
+// ==================== PAYIN ====================
+async function dispatchPayinSuccess(referenceId, { utr, amount } = {}) {
+  const payinStore = require("./payin-store.service");
+  const payin = payinStore.getPayin(referenceId);
+  const finalUtr = utr || `UTR${Date.now()}${Math.floor(Math.random() * 1000)}`;
+  const payload = {
+    event: "PAYIN_SUCCESS",
+    type: "PAYIN_SUCCESS",
+    reference_id: referenceId,
+    gateway_reference: payin?.transferId || `DUMMY_${Date.now()}`,
+    status: "SUCCESS",
+    amount: amount ?? payin?.amount ?? null,
+    utr: finalUtr,
+    fired_at: new Date().toISOString(),
+  };
+  payinStore.updatePayin(referenceId, { status: "COMPLETED", utr: finalUtr });
+  return postWebhook(payload);
+}
+
+async function dispatchPayinFailed(referenceId, { reason, code, amount } = {}) {
+  const payinStore = require("./payin-store.service");
+  const payin = payinStore.getPayin(referenceId);
+  const payload = {
+    event: "PAYIN_FAILED",
+    type: "PAYIN_FAILED",
+    reference_id: referenceId,
+    gateway_reference: payin?.transferId || `DUMMY_${Date.now()}`,
+    status: "FAILED",
+    amount: amount ?? payin?.amount ?? null,
+    failure_reason: reason || "Payment failed at bank",
+    failure_code: code || "PAYMENT_FAILED",
+    fired_at: new Date().toISOString(),
+  };
+  payinStore.updatePayin(referenceId, {
+    status: "FAILED",
+    failureReason: payload.failure_reason,
+    failureCode: payload.failure_code,
+  });
+  return postWebhook(payload);
+}
+
+// ==================== REFUND ====================
+async function dispatchRefundSuccess(gatewayRefundId) {
+  const refundStore = require("./refund-store.service");
+  const refund = refundStore.getRefund(gatewayRefundId);
+  if (!refund) throw new Error(`Refund not found: ${gatewayRefundId}`);
+
+  const payload = {
+    event: "REFUND_SUCCESS",
+    type: "REFUND_SUCCESS",
+    reference_id: refund.referenceId,
+    gateway_refund_id: gatewayRefundId,
+    refund_local_id: refund.localRefundId,
+    refund_amount: refund.amount,
+    status: "SUCCESS",
+    fired_at: new Date().toISOString(),
+  };
+  refundStore.updateRefund(gatewayRefundId, { status: "COMPLETED" });
+  return postWebhook(payload);
+}
+
+async function dispatchRefundFailed(gatewayRefundId, { reason, code } = {}) {
+  const refundStore = require("./refund-store.service");
+  const refund = refundStore.getRefund(gatewayRefundId);
+  if (!refund) throw new Error(`Refund not found: ${gatewayRefundId}`);
+
+  const payload = {
+    event: "REFUND_FAILED",
+    type: "REFUND_FAILED",
+    reference_id: refund.referenceId,
+    gateway_refund_id: gatewayRefundId,
+    refund_local_id: refund.localRefundId,
+    refund_amount: refund.amount,
+    status: "FAILED",
+    failure_reason: reason || "Refund failed at bank",
+    failure_code: code || "REFUND_FAILED",
+    fired_at: new Date().toISOString(),
+  };
+  refundStore.updateRefund(gatewayRefundId, {
+    status: "FAILED",
+    failureReason: payload.failure_reason,
+    failureCode: payload.failure_code,
+  });
+  return postWebhook(payload);
+}
+
+// ==================== CHARGEBACK ====================
+async function dispatchChargebackCreated(
+  gatewayChargebackId,
+  { reason, amount } = {},
+) {
+  const chargebackStore = require("./chargeback-store.service");
+  const cb = chargebackStore.getChargeback(gatewayChargebackId);
+  if (!cb) throw new Error(`Chargeback not found: ${gatewayChargebackId}`);
+
+  const payload = {
+    event: "CHARGEBACK_CREATED",
+    type: "CHARGEBACK_CREATED",
+    reference_id: cb.referenceId,
+    chargeback_id: gatewayChargebackId,
+    amount: amount ?? cb.amount,
+    reason: reason || cb.reason,
+    reason_description: cb.reasonDescription || null,
+    status: "DISPUTED",
+    fired_at: new Date().toISOString(),
+  };
+  return postWebhook(payload);
+}
+
+async function dispatchChargebackReversed(
+  gatewayChargebackId,
+  { reason } = {},
+) {
+  const chargebackStore = require("./chargeback-store.service");
+  const cb = chargebackStore.getChargeback(gatewayChargebackId);
+  if (!cb) throw new Error(`Chargeback not found: ${gatewayChargebackId}`);
+
+  const payload = {
+    event: "CHARGEBACK_REVERSED",
+    type: "CHARGEBACK_REVERSED",
+    reference_id: cb.referenceId,
+    chargeback_id: gatewayChargebackId,
+    amount: cb.amount,
+    reason: reason || "Chargeback reversed by bank",
+    status: "REVERSED",
+    fired_at: new Date().toISOString(),
+  };
+  chargebackStore.updateChargeback(gatewayChargebackId, {
+    status: "REVERSED",
+    reversedAt: new Date().toISOString(),
+  });
+  return postWebhook(payload);
+}
+
+// ==================== PAYOUT ====================
+async function dispatchPayoutSuccess(referenceId, { utr, amount } = {}) {
+  const payout = payoutStore.getPayout(referenceId);
+  const finalUtr = utr || `UTR${Date.now()}${Math.floor(Math.random() * 1000)}`;
+  const payload = {
+    event: "PAYOUT_SUCCESS",
+    type: "PAYOUT_SUCCESS",
+    reference_id: referenceId,
+    transfer_id: payout?.transferId || `DUMMY_${Date.now()}`,
+    transfer_status: "SUCCESS",
+    transfer_amount: amount ?? payout?.amount ?? null,
+    bank_reference: finalUtr,
+    failure_reason: null,
+    failure_code: null,
+    fired_at: new Date().toISOString(),
+  };
+  payoutStore.updatePayout(referenceId, { status: "COMPLETED", utr: finalUtr });
+  return postWebhook(payload);
+}
+
+async function dispatchPayoutFailed(referenceId, { reason, code, amount } = {}) {
+  const payout = payoutStore.getPayout(referenceId);
+  const payload = {
+    event: "PAYOUT_FAILED",
+    type: "PAYOUT_FAILED",
+    reference_id: referenceId,
+    transfer_id: payout?.transferId || `DUMMY_${Date.now()}`,
+    transfer_status: "FAILED",
+    transfer_amount: amount ?? payout?.amount ?? null,
+    bank_reference: null,
+    failure_reason: reason || "Beneficiary account frozen",
+    failure_code: code || "BENEFICIARY_INVALID",
+    fired_at: new Date().toISOString(),
+  };
+  payoutStore.updatePayout(referenceId, {
+    status: "FAILED",
+    failureReason: payload.failure_reason,
+    failureCode: payload.failure_code,
+  });
+  return postWebhook(payload);
+}
+
+async function dispatchPayoutPending(referenceId) {
+  const payout = payoutStore.getPayout(referenceId);
+  const payload = {
+    event: "PAYOUT_PENDING",
+    type: "PAYOUT_PENDING",
+    reference_id: referenceId,
+    transfer_id: payout?.transferId || `DUMMY_${Date.now()}`,
+    transfer_status: "PENDING",
+    transfer_amount: payout?.amount ?? null,
+    bank_reference: null,
+    fired_at: new Date().toISOString(),
+  };
+  payoutStore.updatePayout(referenceId, { status: "PENDING" });
+  return postWebhook(payload);
+}
+
+module.exports = {
+  postWebhook,
+  dispatchPayoutSuccess,
+  dispatchPayoutFailed,
+  dispatchPayoutPending,
+  dispatchPayinSuccess,
+  dispatchPayinFailed,
+  dispatchRefundSuccess,
+  dispatchRefundFailed,
+  dispatchChargebackCreated,
+  dispatchChargebackReversed,
+};
+==================== C:\Users\DELL\Documents\DummyGateway\services\webhook-trigger.service.js ====================
+const axios = require("axios");
+const crypto = require("crypto");
+const bankAccountService = require("./bank-account.service");
+
+const BACKEND_URL =
+  process.env.BACKEND_WEBHOOK_URL || "http://localhost:4000/api/webhooks/dummy";
+const SECRET = process.env.DUMMY_WEBHOOK_SECRET || "dummy-webhook-secret";
+
+/**
+ * Build the webhook payload in the shape dummy.webhook.js expects.
+ */
+function buildPayload({
+  merchantReference,
+  transferId,
+  status,
+  utr,
+  amount,
+  failureReason,
+  failureCode,
+}) {
+  const normalised = String(status || "COMPLETED").toUpperCase();
+
+  const transferStatus =
+    normalised === "COMPLETED"
+      ? "SUCCESS"
+      : normalised === "FAILED"
+        ? "FAILED"
+        : normalised === "PENDING"
+          ? "PENDING"
+          : normalised;
+
+  const event =
+    normalised === "COMPLETED"
+      ? "PAYOUT_SUCCESS"
+      : normalised === "FAILED"
+        ? "PAYOUT_FAILED"
+        : "PAYOUT_PENDING";
+
+  return {
+    event,
+    type: event,
+    reference_id: merchantReference || null,
+    transfer_id: transferId || `DUMMY_${Date.now()}`,
+    transfer_status: transferStatus,
+    transfer_amount: amount != null ? Number(amount) : null,
+    bank_reference: utr || null,
+    failure_reason: failureReason || null,
+    failure_code: failureCode || null,
+    fired_at: new Date().toISOString(),
+  };
+}
+
+function sign(payload) {
+  return crypto
+    .createHmac("sha256", SECRET)
+    .update(JSON.stringify(payload))
+    .digest("hex");
+}
+
+/**
+ * Fire one webhook (unsigned but headers include signature).
+ */
+async function fireOnce(payload) {
+  const signature = sign(payload);
+
+  const started = Date.now();
+  try {
+    const response = await axios.post(BACKEND_URL, payload, {
+      headers: {
+        "Content-Type": "application/json",
+        "x-dummy-signature": signature,
+        "x-webhook-signature": signature,
+      },
+      timeout: 10000,
+      validateStatus: () => true,
+    });
+
+    const result = {
+      ok: response.status >= 200 && response.status < 300,
+      httpStatus: response.status,
+      responseBody: response.data,
+      latencyMs: Date.now() - started,
+      signed: signature,
+    };
+    bankAccountService.logWebhook({ ...payload, result });
+    return result;
+  } catch (error) {
+    const result = {
+      ok: false,
+      httpStatus: 0,
+      responseBody: error.message,
+      latencyMs: Date.now() - started,
+      signed: signature,
+    };
+    bankAccountService.logWebhook({ ...payload, result });
+    throw Object.assign(error, { result });
+  }
+}
+
+/**
+ * Fire webhook. Supports:
+ *  - duplicate:      fires the same eventId twice (2s apart)
+ *  - delaySeconds:   fires after N seconds (fire-and-forget)
+ */
+async function fire({
+  merchantReference,
+  transferId,
+  status = "COMPLETED",
+  utr,
+  amount,
+  failureReason,
+  failureCode,
+  delaySeconds = 0,
+  duplicate = false,
+}) {
+  if (!merchantReference) {
+    throw new Error("merchantReference is required");
+  }
+
+  const payload = buildPayload({
+    merchantReference,
+    transferId,
+    status,
+    utr:
+      utr ||
+      (String(status).toUpperCase() === "COMPLETED"
+        ? `UTR${Date.now()}`
+        : null),
+    amount,
+    failureReason,
+    failureCode,
+  });
+
+  // Delayed fire-and-forget
+  if (delaySeconds && Number(delaySeconds) > 0) {
+    const ms = Number(delaySeconds) * 1000;
+    setTimeout(() => {
+      fireOnce(payload).catch((err) =>
+        console.error("[PayoutMock] Delayed fire failed:", err.message),
+      );
+      if (duplicate) {
+        setTimeout(() => {
+          fireOnce(payload).catch((err) =>
+            console.error(
+              "[PayoutMock] Delayed duplicate fire failed:",
+              err.message,
+            ),
+          );
+        }, 2000);
+      }
+    }, ms);
+
+    return {
+      scheduled: true,
+      delaySeconds: Number(delaySeconds),
+      duplicate: Boolean(duplicate),
+      payload,
+    };
+  }
+
+  // Immediate
+  const result = await fireOnce(payload);
+
+  // Duplicate test
+  let duplicateResult = null;
+  if (duplicate) {
+    await new Promise((r) => setTimeout(r, 2000));
+    duplicateResult = await fireOnce(payload);
+  }
+
+  return {
+    scheduled: false,
+    payload,
+    result,
+    duplicate: duplicate ? duplicateResult : null,
+  };
+}
+
+module.exports = { fire, buildPayload, sign };
+
+

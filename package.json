@@ -1,0 +1,21 @@
+{
+  "name": "payout-mock",
+  "version": "1.0.0",
+  "description": "Dummy bank directory + webhook trigger simulator for fintech payout testing",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node server.js"
+  },
+  "dependencies": {
+    "axios": "^1.7.7",
+    "cors": "^2.8.5",
+    "dotenv": "^16.6.1",
+    "express": "^4.21.1",
+    "morgan": "^1.10.0",
+    "uuid": "^14.0.3"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
